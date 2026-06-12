@@ -248,58 +248,6 @@ export function ProfileScreen({ navigation }: any) {
             <Text style={styles.feedbackButtonText}>📮 问题反馈</Text>
           </TouchableOpacity>
 
-          {Platform.OS === "web" && (
-            <TouchableOpacity style={styles.locationButton} onPress={() => {
-              if (!navigator?.geolocation) { Alert.alert("提示", "浏览器不支持GPS定位"); return; }
-
-              // Safari用watchPosition，比getCurrentPosition更可靠
-              let resolved = false;
-              let watchId: number;
-
-              const cleanup = () => {
-                resolved = true;
-                if (watchId != null) navigator.geolocation.clearWatch(watchId);
-              };
-
-              // 30s 兜底超时
-              const timeout = setTimeout(() => {
-                if (!resolved) {
-                  cleanup();
-                  Alert.alert("定位失败", "定位超时，请移至开阔区域后重试");
-                }
-              }, 30000);
-
-              watchId = navigator.geolocation.watchPosition(
-                () => {
-                  if (!resolved) {
-                    clearTimeout(timeout);
-                    cleanup();
-                    Alert.alert("✅", "定位授权成功，请返回地图查看");
-                  }
-                },
-                (err) => {
-                  if (resolved) return;
-                  clearTimeout(timeout);
-                  cleanup();
-                  let msg: string;
-                  switch (err.code) {
-                    case 1: msg = "定位被拒绝。请在 设置→Safari→位置 中设为「允许」"; break;
-                    case 2: msg = "无法获取位置，请确认已开启GPS并移至开阔区域"; break;
-                    case 3: msg = "定位超时，请检查网络后重试"; break;
-                    default: msg = err.message || "未知错误";
-                  }
-                  Alert.alert("定位失败", msg);
-                },
-                {
-                  enableHighAccuracy: false,
-                  maximumAge: 60000,
-                  timeout: 30000,
-                }
-              );
-            }} activeOpacity={0.7}>
-              <Text style={styles.logoutText}>📍 位置授权</Text>
-            </TouchableOpacity>
-          )}
           <TouchableOpacity style={styles.tutorialButton} onPress={() => { const { setJustLoggedIn } = useAuthStore.getState(); setJustLoggedIn(true); }} activeOpacity={0.7}>
             <Text style={{ ...typography.bodyBold, color: "#FFF" }}>📖 查看教程</Text>
           </TouchableOpacity>
@@ -539,7 +487,6 @@ const styles = StyleSheet.create({
     marginTop: spacing.lg,
     gap: spacing.sm,
   },
-  locationButton: { backgroundColor: colors.info, borderRadius: borderRadius.lg, padding: spacing.lg, alignItems: "center" },
   feedbackButton: {
     backgroundColor: colors.surface,
     borderRadius: borderRadius.xl,

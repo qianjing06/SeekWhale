@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef } from "react";
 import { View, Text, StyleSheet, TouchableOpacity, ActivityIndicator, Modal, Image, Platform } from "react-native";
 import md5 from "md5";
-import { useNavigation } from "@react-navigation/native";
+import { useNavigation, useFocusEffect } from "@react-navigation/native";
 
 let WebView: any = () => null;
 let NativeModules: any = null;
@@ -15,6 +15,14 @@ import { Campus, CAMPUS_NAMES } from "../../utils/constants";
 import { getActiveChests } from "../../services/chest.api";
 import { getSocket, getCurrentSocket } from "../../socket/socketClient";
 import api, { fixImageUrl } from "../../services/api";
+import {
+  getCachedLocation,
+  setCachedLocation,
+  getCachedChests,
+  setCachedChests,
+  getCachedEvents,
+  setCachedEvents,
+} from "../../utils/mapCache";
 
 const CAMPUS_CENTERS: Record<Campus, { lng: number; lat: number; zoom: number }> = {
   gulou: { lng: 118.7750, lat: 32.0575, zoom: 16 },
@@ -38,8 +46,30 @@ export function MapScreen() {
   const [openResult, setOpenResult] = useState<{ success: boolean; error?: string; item?: any; rarity?: string } | null>(null);
   const [showResultModal, setShowResultModal] = useState(false);
   const [nearbyCounts, setNearbyCounts] = useState<Record<string, number>>({});
+  const [initialCenter, setInitialCenter] = useState<{ lat: number; lng: number; zoom: number } | null>(null);
   const socketRef = useRef<any>(null);
   const wv = useRef<WebView>(null);
+  const isFirstFocusRef = useRef(true);
+
+  // ═══ 预加载缓存 ═══
+  useEffect(() => {
+    (async () => {
+      const loc = await getCachedLocation();
+      if (loc) {
+        if (loc.campus !== Campus.GULOU) setCampus(loc.campus);
+        setInitialCenter({ lat: loc.lat, lng: loc.lng, zoom: 16 });
+      }
+      // 预载宝箱和活动缓存
+      const campusKey = loc?.campus || Campus.GULOU;
+      const [ch, ev] = await Promise.all([
+        getCachedChests(campusKey),
+        getCachedEvents(campusKey),
+      ]);
+      if (ch) { setChests(ch.data.chests); setCooldowns(ch.data.cooldowns); }
+      if (ev) { setEvents(ev.data); }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // 自定义高德原生定位
   useEffect(() => {
@@ -53,6 +83,7 @@ export function MapScreen() {
     const sub = DeviceEventEmitter.addListener("AMapLocation", (data: any) => {
       update(data.latitude, data.longitude);
       setUserLocation({ lat: data.latitude, lng: data.longitude });
+      setCachedLocation({ lat: data.latitude, lng: data.longitude, campus });
       const s = getCurrentSocket();
       if (s?.connected) {
         s.emit("location_update", { lat: data.latitude, lng: data.longitude, campus });
@@ -62,18 +93,64 @@ export function MapScreen() {
     return () => { sub.remove(); module.stop(); };
   }, []);
 
+  // 缓存位置就绪后，若 WebView 已就绪 → 直接定位
+  useEffect(() => {
+    if (initialCenter && wv.current && mapState === "ready") {
+      wv.current.postMessage(JSON.stringify({
+        type: "moveTo",
+        lat: initialCenter.lat,
+        lng: initialCenter.lng,
+        zoom: initialCenter.zoom,
+      }));
+    }
+  }, [initialCenter, mapState]);
+
   const fetchAll = useCallback(async () => {
     try {
       const [cR, eR] = await Promise.all([getActiveChests(campus), api.get("/map/activity-pins", { params: { campus } })]);
-      if (cR.success && cR.data) { setChests(cR.data); setCooldowns((cR as any).cooldowns || {normal:0,advanced:0}); };
-      if (eR && (eR as any).success) setEvents((eR as any).data || []);
+      const chestData = cR.data || [];
+      const cooldownData = (cR as any).cooldowns || { normal: 0, advanced: 0 };
+      const eventData = (eR as any)?.data || [];
+
+      if (cR.success && cR.data) { setChests(chestData); setCooldowns(cooldownData);
+        setCachedChests(campus, { chests: chestData, cooldowns: cooldownData });
+      }
+      if (eR && (eR as any).success) { setEvents(eventData);
+        setCachedEvents(campus, eventData);
+      }
       if (wv.current && mapState === "ready") {
-        wv.current.postMessage(JSON.stringify({ type: "updateMarkers", chests: cR.data || [], events: (eR as any)?.data || [] }));
+        wv.current.postMessage(JSON.stringify({ type: "updateMarkers", chests: chestData, events: eventData }));
       }
     } catch {}
   }, [campus, mapState]);
 
   useEffect(() => { fetchAll(); const t = setInterval(fetchAll, 20000); return () => clearInterval(t); }, [fetchAll]);
+
+  // ═══ Tab 切回优化 ═══
+  useFocusEffect(useCallback(() => {
+    if (isFirstFocusRef.current) { isFirstFocusRef.current = false; return; }
+    (async () => {
+      const cachedCh = await getCachedChests(campus);
+      const cachedEv = await getCachedEvents(campus);
+      const now = Date.now();
+      const fresh = (cachedCh && (now - cachedCh.timestamp) < 30000) &&
+                    (cachedEv && (now - cachedEv.timestamp) < 30000);
+      if (fresh) return;
+      if (cachedCh) {
+        setChests(cachedCh.data.chests);
+        setCooldowns(cachedCh.data.cooldowns);
+      }
+      if (cachedEv) { setEvents(cachedEv.data); }
+      if (wv.current && mapState === "ready") {
+        wv.current.postMessage(JSON.stringify({
+          type: "updateMarkers",
+          chests: cachedCh?.data.chests || [],
+          events: cachedEv?.data || [],
+        }));
+      }
+      fetchAll();
+    })();
+  }, [campus, fetchAll, mapState]));
 
   // Socket 监听：开箱结果 & 附近人数
   useEffect(() => {
@@ -111,7 +188,7 @@ export function MapScreen() {
   const handleMsg = (e: any) => {
     try {
       const d = JSON.parse(e.nativeEvent.data);
-      if (d.type === "mapReady") { setMapState("ready"); const ct = CAMPUS_CENTERS[campus]; wv.current?.postMessage(JSON.stringify({ type: "init", lng: ct.lng, lat: ct.lat, zoom: ct.zoom, chests, events })); }
+      if (d.type === "mapReady") { setMapState("ready"); const ct = initialCenter || CAMPUS_CENTERS[campus]; wv.current?.postMessage(JSON.stringify({ type: "init", lng: ct.lng, lat: ct.lat, zoom: ct.zoom, chests, events })); }
       if (d.type === "mapError") setMapState("failed");
       if (d.type === "chestClick") { const c = chests.find((x: any) => x._id === d.chestId); if (c) { setDialogData({ type: c.type === "advanced" ? "advancedChest" : "normalChest", data: { ...c, label: d.label } }); setDialogVisible(true); } }
       if (d.type === "eventClick") { const ev = events.find((x: any) => x._id === d.eventId); if (ev) { setDialogData({ type: "event", data: ev }); setDialogVisible(true); } }

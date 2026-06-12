@@ -31,6 +31,7 @@ export interface CollectionItem {
   itemId: string;
   name: string;
   imageUrl: string;
+  thumbnailUrl?: string;
   rarity: Rarity;
   description?: string;
   count: number;

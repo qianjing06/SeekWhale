@@ -1,11 +1,20 @@
 import React, { useState, useEffect, useCallback, useRef } from "react";
 import { View, Text, StyleSheet, TouchableOpacity, ActivityIndicator, Modal, Image, Dimensions } from "react-native";
-import { useNavigation } from "@react-navigation/native";
+import { useNavigation, useFocusEffect } from "@react-navigation/native";
 import { colors, typography, spacing, borderRadius } from "../../theme";
 import { Campus } from "../../utils/constants";
 import { getActiveChests } from "../../services/chest.api";
 import { getSocket, getCurrentSocket } from "../../socket/socketClient";
 import api, { fixImageUrl } from "../../services/api";
+import {
+  getCachedLocation,
+  setCachedLocation,
+  getCachedChests,
+  setCachedChests,
+  getCachedEvents,
+  setCachedEvents,
+  CachedLocation,
+} from "../../utils/mapCache";
 
 const CAMPUS_CENTERS: Record<Campus, { lng: number; lat: number; zoom: number }> = {
   gulou: { lng: 118.7750, lat: 32.0575, zoom: 16 },
@@ -43,14 +52,61 @@ export function MapScreen() {
   const socketRef = useRef<any>(null); const mapRef = useRef<any>(null); const markersRef = useRef<any>(null);
   const userMarkerRef = useRef<any>(null); const divRef = useRef<any>(null);
   const [mapReady, setMapReady] = useState(false);
+  // 缓存数据引用：在 map init 前就绪
+  const cachedLocationRef = useRef<CachedLocation | null>(null);
+  const cachedChestsRef = useRef<{ chests: any[]; cooldowns: { normal: number; advanced: number } } | null>(null);
+  const cachedEventsRef = useRef<any[] | null>(null);
+  const pendingMarkersRef = useRef<{ chests: any[]; events: any[] } | null>(null);
+  const isFirstFocusRef = useRef(true);
+
+  // ═══ 预加载缓存（在 map init 之前运行）═══
+  useEffect(() => {
+    (async () => {
+      const [loc, ch, ev] = await Promise.all([
+        getCachedLocation(),
+        getCachedChests(campus),
+        getCachedEvents(campus),
+      ]);
+      cachedLocationRef.current = loc;
+      if (loc && loc.campus !== campus) {
+        setCampus(loc.campus);
+      }
+      if (ch) {
+        cachedChestsRef.current = { chests: ch.data.chests, cooldowns: ch.data.cooldowns };
+        setChests(ch.data.chests);
+        setCooldowns(ch.data.cooldowns);
+      }
+      if (ev) {
+        cachedEventsRef.current = ev.data;
+        setEvents(ev.data);
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => { if (!divRef.current || mapRef.current) return; let c = false;
     loadLeaflet().then((leaf) => { if (c || !leaf || !divRef.current) return; L = leaf;
-      const ct = CAMPUS_CENTERS[campus];
-      const map = L.map(divRef.current, { center: [ct.lat, ct.lng], zoom: ct.zoom, zoomControl: false, attributionControl: false });
+      // 优先用缓存位置初始化地图中心，否则用校区中心
+      const cachedLoc = cachedLocationRef.current;
+      const initCenter: [number, number] = cachedLoc
+        ? [cachedLoc.lat, cachedLoc.lng]
+        : [CAMPUS_CENTERS[campus].lat, CAMPUS_CENTERS[campus].lng];
+      const initZoom = cachedLoc ? Math.max(CAMPUS_CENTERS[campus].zoom, 16) : CAMPUS_CENTERS[campus].zoom;
+      const map = L.map(divRef.current, { center: initCenter, zoom: initZoom, zoomControl: false, attributionControl: false });
       L.tileLayer("https://webrd0{s}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}", { subdomains: ["1","2","3","4"], maxZoom: 18, minZoom: 3 }).addTo(map);
       L.control.zoom({ position: "bottomright" }).addTo(map); markersRef.current = L.layerGroup().addTo(map);
       mapRef.current = map; setMapReady(true); setTimeout(() => map.invalidateSize(), 200);
+
+      // 若有缓存位置，立即放置用户标记
+      if (cachedLoc && L) {
+        const icon = L.divIcon({ className: "", html: '<div style="width:22px;height:22px;background:#3498DB;border:4px solid #fff;border-radius:50%;box-shadow:0 0 20px rgba(52,152,219,0.8);"></div>', iconSize: [30, 30], iconAnchor: [15, 15] });
+        userMarkerRef.current = L.marker([cachedLoc.lat, cachedLoc.lng], { icon, zIndexOffset: 9999 }).addTo(map);
+        setUserLocation({ lat: cachedLoc.lat, lng: cachedLoc.lng });
+      }
+      // 若有缓存的宝箱/活动数据，立即渲染标记
+      if (cachedChestsRef.current || cachedEventsRef.current) {
+        updateMarkers(cachedChestsRef.current?.chests || [], cachedEventsRef.current || []);
+      }
     }); return () => { c = true; if (mapRef.current) { mapRef.current.remove(); mapRef.current = null; } };
   }, []);
 
@@ -77,64 +133,119 @@ export function MapScreen() {
   };
 
   useEffect(() => {
-    if (!navigator?.geolocation) { fetchIPFallback(); return; }
-    let first = true; let dead = false; let watchId = 0;
+    let dead = false; let watchId = 0; let firstFix = true; let ipFallbackDone = false;
+
+    const ERR_MSG: Record<number, string> = { 1: "⚠ 请开启定位权限", 2: "⚠ 定位信号弱", 3: "⚠ 定位超时" };
 
     const updatePos = (lat: number, lng: number) => {
       const gcj = wgs84ToGcj02(lat, lng);
       setGpsLabel(`📍 ${gcj.lat.toFixed(6)}, ${gcj.lng.toFixed(6)}`); setUserLocation(gcj);
+      // 缓存位置
+      setCachedLocation({ lat: gcj.lat, lng: gcj.lng, campus });
+      ipFallbackDone = true; // GPS 成功，禁止 IP 兜底覆盖
+
       if (mapRef.current && L) { if (userMarkerRef.current) mapRef.current.removeLayer(userMarkerRef.current);
         const icon = L.divIcon({ className: "", html: '<div style="width:22px;height:22px;background:#3498DB;border:4px solid #fff;border-radius:50%;box-shadow:0 0 20px rgba(52,152,219,0.8);"></div>', iconSize: [30,30], iconAnchor: [15,15] });
         userMarkerRef.current = L.marker([gcj.lat, gcj.lng], { icon, zIndexOffset: 9999 }).addTo(mapRef.current);
-        if (first) { first = false; mapRef.current.setView([gcj.lat, gcj.lng], Math.max(mapRef.current.getZoom(), 16)); }
+        if (firstFix) { firstFix = false; mapRef.current.setView([gcj.lat, gcj.lng], Math.max(mapRef.current.getZoom(), 16)); }
       }
       const s = getCurrentSocket(); if (s?.connected) s.emit("location_update", { lat: gcj.lat, lng: gcj.lng, campus });
     };
 
-    const ERR_MSG: Record<number, string> = { 1: "⚠ 请开启定位权限", 2: "⚠ 定位信号弱", 3: "⚠ 定位超时" };
-    let failCount = 0;
-
-    const startWatch = () => {
-      watchId = navigator.geolocation.watchPosition(
-        (pos) => { failCount = 0; updatePos(pos.coords.latitude, pos.coords.longitude); },
-        (err) => {
-          failCount++;
-          if (!dead) setGpsLabel(ERR_MSG[err.code] || `⚠ 定位失败(${err.code})`);
-          // 连续失败 3 次后切到 IP 定位兜底
-          if (failCount >= 3 && !dead) { fetchIPFallback(); }
-        },
-        { enableHighAccuracy: false, maximumAge: 10000, timeout: 30000 }
-      );
+    // ── IP 定位兜底：与 GPS 并行启动 ──
+    const doIPFallback = async () => {
+      try {
+        const res: any = await api.get("/geo/ip-location");
+        if (dead || ipFallbackDone) return;
+        if (res?.success && res.data) {
+          const { lat, lng, province, city } = res.data;
+          const label = province ? `${province}${city || ""}` : "IP";
+          setGpsLabel(`📍 ${lat.toFixed(6)}, ${lng.toFixed(6)} (${label})`);
+          setUserLocation({ lat, lng });
+          if (mapRef.current && L) {
+            if (userMarkerRef.current) mapRef.current.removeLayer(userMarkerRef.current);
+            const icon = L.divIcon({ className: "", html: '<div style="width:22px;height:22px;background:#F39C12;border:4px solid #fff;border-radius:50%;box-shadow:0 0 20px rgba(243,156,18,0.8);"></div>', iconSize: [30,30], iconAnchor: [15,15] });
+            userMarkerRef.current = L.marker([lat, lng], { icon, zIndexOffset: 9999 }).addTo(mapRef.current);
+            if (!userMarkerRef.current) mapRef.current.setView([lat, lng], Math.max(mapRef.current.getZoom(), 13));
+          }
+          const s = getCurrentSocket(); if (s?.connected) s.emit("location_update", { lat, lng, campus });
+        }
+      } catch {}
     };
 
-    // 延迟 800ms 再请求定位（Safari 页面刚加载时 Geolocation 子系统未就绪）
-    const timer = setTimeout(() => {
-      navigator.geolocation.getCurrentPosition(
-        (pos) => {
-          updatePos(pos.coords.latitude, pos.coords.longitude);
-          // 预热成功后启动持续追踪
-          startWatch();
-        },
-        (err) => {
-          if (!dead) setGpsLabel(ERR_MSG[err.code] || `⚠ 定位失败(${err.code})`);
-          // 第一次就失败了：直接尝试 watchPosition（有时 getCurrentPosition 失败但 watchPosition 能成功）
-          startWatch();
-          // 同时尝试 IP 定位兜底
-          if (!dead) fetchIPFallback();
-        },
-        { enableHighAccuracy: false, timeout: 25000, maximumAge: 120000 }
-      );
-    }, 800);
+    if (!navigator?.geolocation) { doIPFallback(); return; }
 
-    return () => { dead = true; clearTimeout(timer); if (watchId) navigator.geolocation?.clearWatch(watchId); };
+    // IP 兜底并行启动（GPS 成功后会通过 ipFallbackDone 抑制它）
+    doIPFallback();
+
+    // watchPosition 立即启动
+    watchId = navigator.geolocation.watchPosition(
+      (pos) => { updatePos(pos.coords.latitude, pos.coords.longitude); },
+      (err) => { if (!dead && !ipFallbackDone) setGpsLabel(ERR_MSG[err.code] || `⚠ 定位失败(${err.code})`); },
+      { enableHighAccuracy: false, maximumAge: 10000, timeout: 30000 }
+    );
+
+    // getCurrentPosition 也立即启动（不再延迟 800ms）
+    navigator.geolocation.getCurrentPosition(
+      (pos) => { updatePos(pos.coords.latitude, pos.coords.longitude); },
+      (err) => { if (!dead && !ipFallbackDone) setGpsLabel(ERR_MSG[err.code] || `⚠ 定位失败(${err.code})`); },
+      { enableHighAccuracy: false, timeout: 15000, maximumAge: 120000 }
+    );
+
+    return () => { dead = true; if (watchId) navigator.geolocation?.clearWatch(watchId); };
   }, [campus]);
 
   const fetchAll = useCallback(async () => { try {
     const [cR, eR] = await Promise.all([getActiveChests(campus), api.get("/map/activity-pins", { params: { campus } })]);
-    if (cR.success && cR.data) { setChests(cR.data); setCooldowns((cR as any).cooldowns || {normal:0,advanced:0}); }; if (eR && (eR as any).success) setEvents((eR as any).data || []);
-    updateMarkers(cR.data || [], (eR as any)?.data || []);
+    const chestData = cR.data || [];
+    const cooldownData = (cR as any).cooldowns || { normal: 0, advanced: 0 };
+    const eventData = (eR as any)?.data || [];
+
+    if (cR.success && cR.data) { setChests(chestData); setCooldowns(cooldownData);
+      setCachedChests(campus, { chests: chestData, cooldowns: cooldownData });
+    }
+    if (eR && (eR as any).success) { setEvents(eventData);
+      setCachedEvents(campus, eventData);
+    }
+    // 如果地图已就绪 → 立即更新标记；否则暂存等 mapReady
+    if (markersRef.current && L) {
+      updateMarkers(chestData, eventData);
+    } else {
+      pendingMarkersRef.current = { chests: chestData, events: eventData };
+    }
   } catch {} }, [campus]);
   useEffect(() => { fetchAll(); const t = setInterval(fetchAll, 20000); return () => clearInterval(t); }, [fetchAll]);
+
+  // mapReady 后应用待处理的标记更新
+  useEffect(() => {
+    if (mapReady && pendingMarkersRef.current && markersRef.current && L) {
+      updateMarkers(pendingMarkersRef.current.chests, pendingMarkersRef.current.events);
+      pendingMarkersRef.current = null;
+    }
+  }, [mapReady]);
+
+  // ═══ Tab 切回优化：优先展示缓存，后台刷新 ═══
+  useFocusEffect(useCallback(() => {
+    if (isFirstFocusRef.current) { isFirstFocusRef.current = false; return; }
+    (async () => {
+      const cachedEv = await getCachedEvents(campus);
+      const cachedCh = await getCachedChests(campus);
+      const now = Date.now();
+      const fresh = (cachedCh && (now - cachedCh.timestamp) < 30000) &&
+                    (cachedEv && (now - cachedEv.timestamp) < 30000);
+      if (fresh) return; // 轮询保持最新，跳过
+      // 数据可能过期，立即展示缓存 + 后台刷新
+      if (cachedCh) {
+        setChests(cachedCh.data.chests);
+        setCooldowns(cachedCh.data.cooldowns);
+      }
+      if (cachedEv) { setEvents(cachedEv.data); }
+      if (markersRef.current && L) {
+        updateMarkers(cachedCh?.data.chests || [], cachedEv?.data || []);
+      }
+      fetchAll();
+    })();
+  }, [campus, fetchAll]));
 
   useEffect(() => { (async () => { const s = await getSocket(); if (!s) return; socketRef.current = s;
     s.on("chest_open_result", (d: any) => { setUnlockingChestId(null); setOpenResult(d.success ? { success: true, item: d.item, rarity: d.item?.rarity } : { success: false, error: d.error }); setShowResultModal(true); });
@@ -170,31 +281,41 @@ export function MapScreen() {
       {gpsLabel ? (
         <View style={S.gb}>
           <Text style={S.gt}>{gpsLabel}</Text>
-          {gpsLabel.startsWith("⚠") && (
-            <T style={S.gr} onPress={() => {
-              setGpsLabel("🔄 重新定位中...");
-              if (navigator?.geolocation) {
-                navigator.geolocation.getCurrentPosition(
-                  (pos) => {
-                    const gcj = wgs84ToGcj02(pos.coords.latitude, pos.coords.longitude);
-                    setGpsLabel(`📍 ${gcj.lat.toFixed(6)}, ${gcj.lng.toFixed(6)}`);
-                    setUserLocation(gcj);
-                    if (mapRef.current && L) {
-                      if (userMarkerRef.current) mapRef.current.removeLayer(userMarkerRef.current);
-                      const icon = L.divIcon({ className: "", html: '<div style="width:22px;height:22px;background:#3498DB;border:4px solid #fff;border-radius:50%;box-shadow:0 0 20px rgba(52,152,219,0.8);"></div>', iconSize: [30,30], iconAnchor: [15,15] });
-                      userMarkerRef.current = L.marker([gcj.lat, gcj.lng], { icon, zIndexOffset: 9999 }).addTo(mapRef.current);
-                      mapRef.current.setView([gcj.lat, gcj.lng], Math.max(mapRef.current.getZoom(), 16));
-                    }
-                    const s = getCurrentSocket(); if (s?.connected) s.emit("location_update", { lat: gcj.lat, lng: gcj.lng, campus });
-                  },
-                  () => { setGpsLabel("⚠ 定位信号弱"); fetchIPFallback(); },
-                  { enableHighAccuracy: false, timeout: 20000 }
-                );
-              } else { fetchIPFallback(); }
-            }} activeOpacity={0.7}>
-              <Text style={S.grt}>🔄 重试</Text>
-            </T>
-          )}
+          {/* 定位授权/重试 — 从个人中心移过来，始终可见 */}
+          <T style={S.gr} onPress={() => {
+            setGpsLabel("🔄 正在定位...");
+            if (!navigator?.geolocation) { fetchIPFallback(); return; }
+            // Safari 用 watchPosition 触发权限弹窗，比 getCurrentPosition 更可靠
+            let resolved = false; let watchId: number;
+            const cleanup = () => { resolved = true; if (watchId != null) navigator.geolocation.clearWatch(watchId); };
+            const timeout = setTimeout(() => { if (!resolved) { cleanup(); setGpsLabel("⚠ 定位超时"); fetchIPFallback(); } }, 20000);
+            watchId = navigator.geolocation.watchPosition(
+              (pos) => {
+                if (resolved) return;
+                clearTimeout(timeout); cleanup();
+                const gcj = wgs84ToGcj02(pos.coords.latitude, pos.coords.longitude);
+                setGpsLabel(`📍 ${gcj.lat.toFixed(6)}, ${gcj.lng.toFixed(6)}`);
+                setUserLocation(gcj);
+                if (mapRef.current && L) {
+                  if (userMarkerRef.current) mapRef.current.removeLayer(userMarkerRef.current);
+                  const icon = L.divIcon({ className: "", html: '<div style="width:22px;height:22px;background:#3498DB;border:4px solid #fff;border-radius:50%;box-shadow:0 0 20px rgba(52,152,219,0.8);"></div>', iconSize: [30,30], iconAnchor: [15,15] });
+                  userMarkerRef.current = L.marker([gcj.lat, gcj.lng], { icon, zIndexOffset: 9999 }).addTo(mapRef.current);
+                  mapRef.current.setView([gcj.lat, gcj.lng], Math.max(mapRef.current.getZoom(), 16));
+                }
+                const s = getCurrentSocket(); if (s?.connected) s.emit("location_update", { lat: gcj.lat, lng: gcj.lng, campus });
+              },
+              (err) => {
+                if (resolved) return;
+                clearTimeout(timeout); cleanup();
+                const msgs: Record<number, string> = { 1: "⚠ 请在设置中允许定位", 2: "⚠ 定位信号弱", 3: "⚠ 定位超时" };
+                setGpsLabel(msgs[err.code] || "⚠ 定位失败");
+                fetchIPFallback();
+              },
+              { enableHighAccuracy: false, maximumAge: 60000, timeout: 20000 }
+            );
+          }} activeOpacity={0.7}>
+            <Text style={S.grt}>{gpsLabel.startsWith("⚠") ? "🔄 重试" : "📍 位置授权"}</Text>
+          </T>
         </View>
       ) : null}
       <View style={{ flex: 1 }}>

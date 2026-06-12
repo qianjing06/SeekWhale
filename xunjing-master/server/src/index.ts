@@ -41,8 +41,15 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // ── 静态文件（上传的图片） ──
+// UUID文件名 = 不可变资源，缓存365天，大幅提升展柜图片加载速度
 const uploadDir = process.env.UPLOAD_DIR || "./uploads";
-app.use("/uploads", express.static(path.resolve(uploadDir)));
+app.use(
+  "/uploads",
+  express.static(path.resolve(uploadDir), {
+    maxAge: "365d",
+    immutable: true,
+  })
+);
 
 // ── 健康检查 ──
 app.get("/api/health", (_req, res) => {
