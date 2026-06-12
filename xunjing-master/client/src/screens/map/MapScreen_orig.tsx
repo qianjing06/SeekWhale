@@ -6,10 +6,6 @@ import { Campus } from "../../utils/constants";
 import { getActiveChests } from "../../services/chest.api";
 import { getSocket, getCurrentSocket } from "../../socket/socketClient";
 import api, { fixImageUrl } from "../../services/api";
-import {
-  setCachedLocation, setCachedChests, setCachedEvents,
-  getCachedLocation, getCachedChests, getCachedEvents,
-} from "../../utils/mapCache";
 
 const CAMPUS_CENTERS: Record<Campus, { lng: number; lat: number; zoom: number }> = {
   gulou: { lng: 118.7750, lat: 32.0575, zoom: 16 },
@@ -47,34 +43,7 @@ export function MapScreen() {
   const socketRef = useRef<any>(null); const mapRef = useRef<any>(null); const markersRef = useRef<any>(null);
   const userMarkerRef = useRef<any>(null); const divRef = useRef<any>(null);
   const [mapReady, setMapReady] = useState(false);
-  const hasCenteredRef = useRef(false);        // 首次定位已居中
-  const gpsFixedRef = useRef(false);           // GPS 已成功定位（防止 IP 兜底覆盖）
-  const locationRef = useRef(userLocation);    // 供回调中读取最新值
-  locationRef.current = userLocation;
 
-  // ===== 1. 页面加载瞬间读取缓存 → 0ms 展示 =====
-  useEffect(() => {
-    (async () => {
-      const [cLoc, cChests, cEvents] = await Promise.all([
-        getCachedLocation(),
-        getCachedChests(campus),
-        getCachedEvents(campus),
-      ]);
-      if (cLoc && cLoc.campus === campus) {
-        setUserLocation({ lat: cLoc.lat, lng: cLoc.lng });
-        setGpsLabel(`📍 ${cLoc.lat.toFixed(6)}, ${cLoc.lng.toFixed(6)} (上次位置)`);
-      }
-      if (cChests?.data) {
-        setChests(cChests.data.chests || []);
-        setCooldowns(cChests.data.cooldowns || { normal: 0, advanced: 0 });
-      }
-      if (cEvents?.data) {
-        setEvents(cEvents.data);
-      }
-    })();
-  }, []);
-
-  // ===== 2. 初始化 Leaflet 地图 =====
   useEffect(() => { if (!divRef.current || mapRef.current) return; let c = false;
     loadLeaflet().then((leaf) => { if (c || !leaf || !divRef.current) return; L = leaf;
       const ct = CAMPUS_CENTERS[campus];
@@ -85,117 +54,94 @@ export function MapScreen() {
     }); return () => { c = true; if (mapRef.current) { mapRef.current.remove(); mapRef.current = null; } };
   }, []);
 
-  // ===== 3. 用户标记：userLocation 变化时自动更新 =====
-  const updateUserMarker = useCallback((loc: { lat: number; lng: number }, isCached: boolean) => {
-    if (!mapRef.current || !L) return;
-    if (userMarkerRef.current) mapRef.current.removeLayer(userMarkerRef.current);
-    const color = isCached ? "#95A5A6" : "#3498DB";
-    const shadow = isCached ? "rgba(149,165,166,0.5)" : "rgba(52,152,219,0.8)";
-    const icon = L.divIcon({ className: "", html: `<div style="width:22px;height:22px;background:${color};border:4px solid #fff;border-radius:50%;box-shadow:0 0 20px ${shadow};transition:background 0.5s,box-shadow 0.5s;"></div>`, iconSize: [30,30], iconAnchor: [15,15] });
-    userMarkerRef.current = L.marker([loc.lat, loc.lng], { icon, zIndexOffset: 9999 }).addTo(mapRef.current);
-    // 首次定位居中
-    if (!hasCenteredRef.current) {
-      hasCenteredRef.current = true;
-      mapRef.current.setView([loc.lat, loc.lng], Math.max(mapRef.current.getZoom(), 16));
-    }
-    const s = getCurrentSocket(); if (s?.connected) s.emit("location_update", { lat: loc.lat, lng: loc.lng, campus });
-  }, [campus]);
-
-  useEffect(() => {
-    if (!mapReady || !userLocation) return;
-    const isCached = gpsLabel.includes("上次") || gpsLabel.includes("缓存");
-    updateUserMarker(userLocation, isCached);
-  }, [mapReady, userLocation, updateUserMarker]);
-
-  // ===== 4. IP 定位兜底（仅 GPS 从未成功时使用） =====
+  // IP 定位兜底（通过后端代理，避免浏览器 CORS 拦截）
   const fetchIPFallback = async () => {
-    if (gpsFixedRef.current) return; // GPS 已经成功过，不覆盖
     try {
       const res: any = await api.get("/geo/ip-location");
-      if (res?.success && res.data && !gpsFixedRef.current) {
+      if (res?.success && res.data) {
         const { lat, lng, province, city } = res.data;
         const label = province ? `${province}${city || ""}` : "IP";
         setGpsLabel(`📍 ${lat.toFixed(6)}, ${lng.toFixed(6)} (${label})`);
         setUserLocation({ lat, lng });
+        if (mapRef.current && L) {
+          if (userMarkerRef.current) mapRef.current.removeLayer(userMarkerRef.current);
+          const icon = L.divIcon({ className: "", html: '<div style="width:22px;height:22px;background:#F39C12;border:4px solid #fff;border-radius:50%;box-shadow:0 0 20px rgba(243,156,18,0.8);"></div>', iconSize: [30,30], iconAnchor: [15,15] });
+          userMarkerRef.current = L.marker([lat, lng], { icon, zIndexOffset: 9999 }).addTo(mapRef.current);
+          if (!userLocation) mapRef.current.setView([lat, lng], Math.max(mapRef.current.getZoom(), 13));
+        }
         const s = getCurrentSocket(); if (s?.connected) s.emit("location_update", { lat, lng, campus });
+        return true;
       }
     } catch {}
+    return false;
   };
 
-  // ===== 5. GPS 渐进式定位（网络优先 → GPS 精修） =====
-  // 关键：手机 GPS 芯片冷启动首次定位(TTFF)需 12-30 秒。
-  // enableHighAccuracy=true + timeout=10s → 冷芯片直接超时！
-  // 正确策略：enableHighAccuracy=false 先用网络/WiFi 定位（1-3s 所有设备通用），
-  // 然后 watchPosition 等 GPS 芯片预热后自动升级精度。
   useEffect(() => {
-    if (!navigator?.geolocation) {
-      if (!locationRef.current) fetchIPFallback();
-      return;
-    }
-    let dead = false;
-    let watchId = 0;
-    let networkFixed = false; // 网络定位已成功（至少有个大概位置）
-    const ERR_MSG: Record<number, string> = { 1: "⚠ 请开启定位权限", 2: "⚠ 定位信号弱", 3: "⚠ 定位超时" };
+    if (!navigator?.geolocation) { fetchIPFallback(); return; }
+    let first = true; let dead = false; let watchId = 0;
 
-    const updatePos = (lat: number, lng: number, src?: string) => {
+    const updatePos = (lat: number, lng: number) => {
       const gcj = wgs84ToGcj02(lat, lng);
-      gpsFixedRef.current = true;
-      const tag = src === "gps" ? "📍" : "📍";
-      setGpsLabel(`${tag} ${gcj.lat.toFixed(6)}, ${gcj.lng.toFixed(6)}${src === "gps" ? "" : ""}`);
-      setUserLocation(gcj);
-      setCachedLocation({ lat: gcj.lat, lng: gcj.lng, campus });
+      setGpsLabel(`📍 ${gcj.lat.toFixed(6)}, ${gcj.lng.toFixed(6)}`); setUserLocation(gcj);
+      if (mapRef.current && L) { if (userMarkerRef.current) mapRef.current.removeLayer(userMarkerRef.current);
+        const icon = L.divIcon({ className: "", html: '<div style="width:22px;height:22px;background:#3498DB;border:4px solid #fff;border-radius:50%;box-shadow:0 0 20px rgba(52,152,219,0.8);"></div>', iconSize: [30,30], iconAnchor: [15,15] });
+        userMarkerRef.current = L.marker([gcj.lat, gcj.lng], { icon, zIndexOffset: 9999 }).addTo(mapRef.current);
+        if (first) { first = false; mapRef.current.setView([gcj.lat, gcj.lng], Math.max(mapRef.current.getZoom(), 16)); }
+      }
+      const s = getCurrentSocket(); if (s?.connected) s.emit("location_update", { lat: gcj.lat, lng: gcj.lng, campus });
     };
 
-    // ★ Phase 1: 网络定位（enableHighAccuracy=false）
-    //    不强制启动 GPS 芯片，仅用 WiFi / 基站 / IP → 1-3 秒内返回
-    //    所有手机（iOS/Android）都能在数秒内成功
-    navigator.geolocation.getCurrentPosition(
-      (pos) => {
-        networkFixed = true;
-        updatePos(pos.coords.latitude, pos.coords.longitude, "net");
-      },
-      (err) => {
-        // 网络定位失败（罕见：设备无 WiFi/基站）
-        if (!dead && !gpsFixedRef.current && !networkFixed) {
-          setGpsLabel("📍 正在获取位置...");
-        }
-      },
-      { enableHighAccuracy: false, timeout: 10000, maximumAge: 120000 }
-    );
+    const ERR_MSG: Record<number, string> = { 1: "⚠ 请开启定位权限", 2: "⚠ 定位信号弱", 3: "⚠ 定位超时" };
+    let failCount = 0;
 
-    // ★ Phase 2: GPS 精修（enableHighAccuracy=true + 长超时）
-    //    给 GPS 芯片充足时间完成冷启动（最长 30 秒）
-    //    一旦锁定，自动替换网络定位为高精度 GPS 位置
-    watchId = navigator.geolocation.watchPosition(
-      (pos) => {
-        networkFixed = true;
-        updatePos(pos.coords.latitude, pos.coords.longitude, "gps");
-      },
-      (err) => {
-        if (!dead) {
-          if (locationRef.current) {
-            // 有位置（缓存/网络/GPS历史）：保留，不覆盖为错误
-            if (!gpsFixedRef.current) {
-              setGpsLabel(`📍 ${locationRef.current.lat.toFixed(6)}, ${locationRef.current.lng.toFixed(6)} (信号弱)`);
-            }
-          } else if (!networkFixed) {
-            // 完全没有任何位置 → 显示具体错误
-            setGpsLabel(ERR_MSG[err.code] || `⚠ 定位失败(${err.code})`);
-            // 权限被拒 → 立即 IP 兜底
-            if (err.code === 1) fetchIPFallback();
-          }
-        }
-      },
-      { enableHighAccuracy: true, maximumAge: 60000, timeout: 30000 }
-    );
+    const startWatch = () => {
+      watchId = navigator.geolocation.watchPosition(
+        (pos) => { failCount = 0; updatePos(pos.coords.latitude, pos.coords.longitude); },
+        (err) => {
+          failCount++;
+          if (!dead) setGpsLabel(ERR_MSG[err.code] || `⚠ 定位失败(${err.code})`);
+          // 连续失败 3 次后切到 IP 定位兜底
+          if (failCount >= 3 && !dead) { fetchIPFallback(); }
+        },
+        { enableHighAccuracy: false, maximumAge: 10000, timeout: 30000 }
+      );
+    };
 
-    return () => { dead = true; if (watchId) navigator.geolocation?.clearWatch(watchId); };
+    // 延迟 800ms 再请求定位（Safari 页面刚加载时 Geolocation 子系统未就绪）
+    const timer = setTimeout(() => {
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          updatePos(pos.coords.latitude, pos.coords.longitude);
+          // 预热成功后启动持续追踪
+          startWatch();
+        },
+        (err) => {
+          if (!dead) setGpsLabel(ERR_MSG[err.code] || `⚠ 定位失败(${err.code})`);
+          // 第一次就失败了：直接尝试 watchPosition（有时 getCurrentPosition 失败但 watchPosition 能成功）
+          startWatch();
+          // 同时尝试 IP 定位兜底
+          if (!dead) fetchIPFallback();
+        },
+        { enableHighAccuracy: false, timeout: 25000, maximumAge: 120000 }
+      );
+    }, 800);
+
+    return () => { dead = true; clearTimeout(timer); if (watchId) navigator.geolocation?.clearWatch(watchId); };
   }, [campus]);
 
-  // ===== 6. 宝箱 & 活动标记更新（响应式：缓存/API 都能触发） =====
-  const updateMarkers = useCallback((ch: any[], ev: any[]) => {
-    if (!markersRef.current || !L) return;
-    markersRef.current.clearLayers();
+  const fetchAll = useCallback(async () => { try {
+    const [cR, eR] = await Promise.all([getActiveChests(campus), api.get("/map/activity-pins", { params: { campus } })]);
+    if (cR.success && cR.data) { setChests(cR.data); setCooldowns((cR as any).cooldowns || {normal:0,advanced:0}); }; if (eR && (eR as any).success) setEvents((eR as any).data || []);
+    updateMarkers(cR.data || [], (eR as any)?.data || []);
+  } catch {} }, [campus]);
+  useEffect(() => { fetchAll(); const t = setInterval(fetchAll, 20000); return () => clearInterval(t); }, [fetchAll]);
+
+  useEffect(() => { (async () => { const s = await getSocket(); if (!s) return; socketRef.current = s;
+    s.on("chest_open_result", (d: any) => { setUnlockingChestId(null); setOpenResult(d.success ? { success: true, item: d.item, rarity: d.item?.rarity } : { success: false, error: d.error }); setShowResultModal(true); });
+    s.on("chest_player_count", (d: any) => { setNearbyCounts(p => ({ ...p, [d.chestId]: d.currentCount })); });
+  })(); return () => { const s = socketRef.current; if (s) { s.off("chest_open_result"); s.off("chest_player_count"); } }; }, []);
+
+  const updateMarkers = (ch: any[], ev: any[]) => { if (!markersRef.current || !L) return; markersRef.current.clearLayers();
     ch.forEach((c, i) => { const a = c.type === "advanced";
       const svg = a ? `<div style="filter:drop-shadow(0 3px 12px rgba(155,89,182,0.5))"><svg viewBox="0 0 40 42" width="40" height="42"><rect x="3" y="10" width="34" height="12" rx="6" fill="#9B59B6" stroke="#6C3483" stroke-width="2.5"/><rect x="3" y="10" width="34" height="5" rx="6" fill="#C39BD3"/><rect x="3" y="20" width="34" height="20" rx="6" fill="#7D3C98" stroke="#6C3483" stroke-width="2.5"/><circle cx="20" cy="30" r="4" fill="#DAA520"/></svg></div>` : `<div style="filter:drop-shadow(0 3px 6px rgba(0,0,0,0.3))"><svg viewBox="0 0 36 38" width="36" height="38"><rect x="2" y="8" width="32" height="12" rx="6" fill="#F5A623" stroke="#8B572A" stroke-width="2.5"/><rect x="2" y="18" width="32" height="18" rx="6" fill="#E8961A" stroke="#8B572A" stroke-width="2.5"/><circle cx="18" cy="27" r="4" fill="#8B572A"/></svg></div>`;
       const icon = L.divIcon({ className: "", html: svg, iconSize: a ? [40,42] : [36,38], iconAnchor: a ? [20,42] : [18,38] });
@@ -206,36 +152,8 @@ export function MapScreen() {
       const icon = L.divIcon({ className: "", html: pin, iconSize: [28,36], iconAnchor: [14,36] });
       const m = L.marker([e.meetCoordinates.lat, e.meetCoordinates.lng], { icon }); m.on("click", () => { setDialogData({ type: "event", data: e }); setDialogVisible(true); }); markersRef.current.addLayer(m);
     });
-  }, []);
+  };
 
-  // ★ 宝箱/活动数据变化 → 自动更新标记（包括缓存数据和 API 数据）
-  useEffect(() => {
-    if (!mapReady) return;
-    updateMarkers(chests, events);
-  }, [mapReady, chests, events, updateMarkers]);
-
-  // ===== 7. 定时拉取最新宝箱 & 活动数据 =====
-  const fetchAll = useCallback(async () => { try {
-    const [cR, eR] = await Promise.all([getActiveChests(campus), api.get("/map/activity-pins", { params: { campus } })]);
-    if (cR.success && cR.data) {
-      setChests(cR.data);
-      setCooldowns((cR as any).cooldowns || { normal: 0, advanced: 0 });
-      setCachedChests(campus, { chests: cR.data, cooldowns: (cR as any).cooldowns || { normal: 0, advanced: 0 } });
-    }
-    if (eR && (eR as any).success) {
-      setEvents((eR as any).data || []);
-      setCachedEvents(campus, (eR as any).data || []);
-    }
-  } catch {} }, [campus]);
-  useEffect(() => { fetchAll(); const t = setInterval(fetchAll, 20000); return () => clearInterval(t); }, [fetchAll]);
-
-  // ===== 8. Socket 事件 =====
-  useEffect(() => { (async () => { const s = await getSocket(); if (!s) return; socketRef.current = s;
-    s.on("chest_open_result", (d: any) => { setUnlockingChestId(null); setOpenResult(d.success ? { success: true, item: d.item, rarity: d.item?.rarity } : { success: false, error: d.error }); setShowResultModal(true); });
-    s.on("chest_player_count", (d: any) => { setNearbyCounts(p => ({ ...p, [d.chestId]: d.currentCount })); });
-  })(); return () => { const s = socketRef.current; if (s) { s.off("chest_open_result"); s.off("chest_player_count"); } }; }, []);
-
-  // ===== 工具函数 =====
   const getDist = (a: number, b: number, c: number, d: number) => { const R = 6371000; const dLat = (c-a)*Math.PI/180; const dLng = (d-b)*Math.PI/180; const x = Math.sin(dLat/2)**2 + Math.cos(a*Math.PI/180)*Math.cos(c*Math.PI/180)*Math.sin(dLng/2)**2; return Math.round(R*2*Math.atan2(Math.sqrt(x), Math.sqrt(1-x))); };
   const handleUnlock = async (id: string) => { const s = socketRef.current || await getSocket(); if (!s?.connected || !userLocation) return; setUnlockingChestId(id); setDialogVisible(false); s.emit("location_update", { lat: userLocation.lat, lng: userLocation.lng, campus }); setTimeout(() => s.emit("chest_open_request", { chestId: id }), 300); };
   const closeDialog = () => setDialogVisible(false);
@@ -256,28 +174,21 @@ export function MapScreen() {
             <T style={S.gr} onPress={() => {
               setGpsLabel("🔄 重新定位中...");
               if (navigator?.geolocation) {
-                // 先快速网络定位，再高精度 GPS
                 navigator.geolocation.getCurrentPosition(
                   (pos) => {
                     const gcj = wgs84ToGcj02(pos.coords.latitude, pos.coords.longitude);
-                    gpsFixedRef.current = true;
                     setGpsLabel(`📍 ${gcj.lat.toFixed(6)}, ${gcj.lng.toFixed(6)}`);
                     setUserLocation(gcj);
-                    setCachedLocation({ lat: gcj.lat, lng: gcj.lng, campus });
-                    // 继续尝试 GPS 精度（后台）
-                    navigator.geolocation.getCurrentPosition(
-                      (pos2) => {
-                        const gcj2 = wgs84ToGcj02(pos2.coords.latitude, pos2.coords.longitude);
-                        setGpsLabel(`📍 ${gcj2.lat.toFixed(6)}, ${gcj2.lng.toFixed(6)}`);
-                        setUserLocation(gcj2);
-                        setCachedLocation({ lat: gcj2.lat, lng: gcj2.lng, campus });
-                      },
-                      () => {},
-                      { enableHighAccuracy: true, timeout: 30000, maximumAge: 60000 }
-                    );
+                    if (mapRef.current && L) {
+                      if (userMarkerRef.current) mapRef.current.removeLayer(userMarkerRef.current);
+                      const icon = L.divIcon({ className: "", html: '<div style="width:22px;height:22px;background:#3498DB;border:4px solid #fff;border-radius:50%;box-shadow:0 0 20px rgba(52,152,219,0.8);"></div>', iconSize: [30,30], iconAnchor: [15,15] });
+                      userMarkerRef.current = L.marker([gcj.lat, gcj.lng], { icon, zIndexOffset: 9999 }).addTo(mapRef.current);
+                      mapRef.current.setView([gcj.lat, gcj.lng], Math.max(mapRef.current.getZoom(), 16));
+                    }
+                    const s = getCurrentSocket(); if (s?.connected) s.emit("location_update", { lat: gcj.lat, lng: gcj.lng, campus });
                   },
-                  () => { setGpsLabel("⚠ 定位信号弱"); if (!gpsFixedRef.current) fetchIPFallback(); },
-                  { enableHighAccuracy: false, timeout: 8000, maximumAge: 120000 }
+                  () => { setGpsLabel("⚠ 定位信号弱"); fetchIPFallback(); },
+                  { enableHighAccuracy: false, timeout: 20000 }
                 );
               } else { fetchIPFallback(); }
             }} activeOpacity={0.7}>

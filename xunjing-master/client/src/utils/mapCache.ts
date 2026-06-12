@@ -60,8 +60,8 @@ async function setItem<T>(key: string, data: T): Promise<void> {
 
 // ---- 对外接口 ----
 
-// 位置缓存（TTL: 2小时）
-const LOCATION_MAX_AGE = 2 * 60 * 60 * 1000;
+// 位置缓存（TTL: 30分钟）—— 只用于地图初始中心，蓝点等 GPS 确认后才显示
+const LOCATION_MAX_AGE = 30 * 60 * 1000;
 
 export async function getCachedLocation(): Promise<CachedLocation | null> {
   return getItem<CachedLocation>(LOCATION_KEY, LOCATION_MAX_AGE);
